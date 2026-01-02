@@ -3,13 +3,13 @@ channels:
   - conda-forge
   - pyviz
 dependencies:
+  - python>=3.10
   - bokeh
-  - dask
+  - dask=2025.10.0
   - dask-jobqueue
   - dask-ml
   - datashader
-  - distributed
-  - fastparquet
+  - distributed=2025.10.0
   - h5py
   - holoviews
   - ipympl
@@ -22,12 +22,8 @@ dependencies:
   - numpy
   - pandas
   - pip
-  - pip:
-      - pulp
-      - parse
-  - pyarrow
+  - pyarrow>=10.0.0
   - pytables
-  - python=3.11
   - scikit-image
   - scikit-learn
   - scipy
@@ -35,3 +31,6 @@ dependencies:
   - statsmodels
   - tifffile
   - zarr
+  - pip:
+      - pulp
+      - parse
