@@ -1,3 +1,4 @@
+# Data files
 **/*.csv
 **/*.avi
 **/*.hdf5
@@ -7,5 +8,29 @@
 **/*.zip
 **/*.obo
 **/*.mp4
-.*
-!/.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv
+env/
+venv/
