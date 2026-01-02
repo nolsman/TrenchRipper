@@ -561,6 +561,30 @@ class fish_analysis():
         ## remove_bit_list specifies a list of bit indices on the encoded RNA molecule to remove
         ## trying to fix this, I think it is broken
         
+        # self.headpath = headpath
+        # self.nanoporedfpath = nanoporedfpath
+        # self.subsample = subsample
+        # self.barcode_len = barcode_len
+        # self.hamming_thr = hamming_thr
+        # self.channel_names = channel_names
+        # self.cycleorder = cycleorder
+        # self.percentilepath = headpath + "/percentiles"
+
+        # self.removed_bits = remove_bit_list
+        # self.removed_bit_cycles = [cycleorder.index(bit) for bit in self.removed_bits]
+
+        # kymograph_metadata = dd.read_parquet(self.percentilepath,calculate_divisions=True)
+        # kymograph_metadata = kymograph_metadata.set_index("trenchid", drop=True, sorted=True)
+
+        # self.trenchids = list(kymograph_metadata.index.compute().get_level_values(0).unique())
+        # if (self.subsample != None) and (self.subsample<len(self.trenchids)):
+        #     selected_trenchids = sorted(list(np.random.choice(self.trenchids,(self.subsample,),replace=False)))
+        #     kymograph_metadata = kymograph_metadata.loc[selected_trenchids]
+
+        # self.kymograph_metadata_subsample = kymograph_metadata.compute().reset_index().set_index(["trenchid","timepoints"],drop=True)
+        # self.signal_sum, self.signal_filter_thr, self.barcodes_median, self.barcodes = get_signal_sum(self.kymograph_metadata_subsample,\
+        #                                                         barcode_len=self.barcode_len,removed_bit_cycles=self.removed_bit_cycles,\
+        #                                                         channel_list=self.channel_names)
         self.headpath = headpath
         self.nanoporedfpath = nanoporedfpath
         self.subsample = subsample
@@ -573,19 +597,30 @@ class fish_analysis():
         self.removed_bits = remove_bit_list
         self.removed_bit_cycles = [cycleorder.index(bit) for bit in self.removed_bits]
 
-        kymograph_metadata = dd.read_parquet(self.percentilepath,calculate_divisions=True)
-        kymograph_metadata = kymograph_metadata.set_index("trenchid", drop=True, sorted=True)
+        # Load without setting index
+        kymograph_metadata = dd.read_parquet(self.percentilepath)
+    
+        # Get unique trenchids
+        self.trenchids = kymograph_metadata["trenchid"].unique().compute().tolist()
+        print(f"Total unique trenchids: {len(self.trenchids)}")
+    
+        if (self.subsample is not None) and (self.subsample < len(self.trenchids)):
+            selected_trenchids = sorted(list(np.random.choice(self.trenchids, (self.subsample,), replace=False)))
+            print(f"Subsampled to {len(selected_trenchids)} trenchids")
+            # Use boolean filtering instead of .loc
+            kymograph_metadata = kymograph_metadata[kymograph_metadata["trenchid"].isin(selected_trenchids)]
 
-        self.trenchids = list(kymograph_metadata.index.compute().get_level_values(0).unique())
-        if (self.subsample != None) and (self.subsample<len(self.trenchids)):
-            selected_trenchids = sorted(list(np.random.choice(self.trenchids,(self.subsample,),replace=False)))
-            kymograph_metadata = kymograph_metadata.loc[selected_trenchids]
-
-        self.kymograph_metadata_subsample = kymograph_metadata.compute().reset_index().set_index(["trenchid","timepoints"],drop=True)
-        self.signal_sum, self.signal_filter_thr, self.barcodes_median, self.barcodes = get_signal_sum(self.kymograph_metadata_subsample,\
-                                                                barcode_len=self.barcode_len,removed_bit_cycles=self.removed_bit_cycles,\
-                                                                channel_list=self.channel_names)
-
+        # Compute to pandas first, then set MultiIndex
+        self.kymograph_metadata_subsample = kymograph_metadata.compute()
+        print(f"Loaded {len(self.kymograph_metadata_subsample)} rows")
+        self.kymograph_metadata_subsample = self.kymograph_metadata_subsample.set_index(["trenchid", "timepoints"], drop=True)
+    
+        self.signal_sum, self.signal_filter_thr, self.barcodes_median, self.barcodes = get_signal_sum(
+            self.kymograph_metadata_subsample,
+            barcode_len=self.barcode_len,
+            removed_bit_cycles=self.removed_bit_cycles,
+            channel_list=self.channel_names
+        )
     def plot_signal_threshold(self,signal_filter_thr,figsize=(12,8)):
         self.signal_filter_thr = signal_filter_thr
         high_signal_mask = self.signal_sum>self.signal_filter_thr
@@ -727,11 +762,22 @@ class fish_analysis():
 
     def get_barcode_df(self,epsilon=0.1):
         print("Getting Barcode df...")
-        self.kymograph_metadata = dd.read_parquet(self.percentilepath,calculate_divisions=True)
+        self.kymograph_metadata = dd.read_parquet(self.percentilepath)
         trench_group = self.kymograph_metadata.groupby(["trenchid"])
         barcodes = trench_group.apply(lambda x: list(itertools.chain.from_iterable([x[channel].tolist()\
                                     for channel in self.channel_names]))).compute()
-        barcodes = barcodes.apply(lambda x: np.array(eval(x)))
+		
+        # barcodes = barcodes.apply(lambda x: np.array(eval(x)))
+		###Claude
+        def to_array(x):
+            if isinstance(x, list):
+                return np.array(x)
+            elif isinstance(x, str):
+                return np.array(eval(x))
+            else:
+                return np.array(x)
+    
+        barcodes = barcodes.apply(to_array)
         short = barcodes.apply(lambda x: len(x) != self.barcode_len)
         barcodes[short] = [np.array([0. for i in range(self.barcode_len)]) for i in range(len(short))]
 
@@ -751,7 +797,7 @@ class fish_analysis():
 
     def get_nanopore_df(self):
         print("Getting Nanopore df...")
-        nanopore_df = pd.read_csv(self.nanoporedfpath,delimiter="\t",index_col=0)
+        nanopore_df = pd.read_parquet(self.nanoporedfpath)
         nanopore_df = remove_bits(nanopore_df,self.removed_bits)
 
         nanopore_lookup = {}

@@ -24,6 +24,7 @@ from .trcluster import hdf5lock
 from .utils import multifov,pandas_hdf5_handler,writedir
 from .daskutils import add_list_to_column
 from tifffile import imread
+import pyarrow.dataset as ds
 
 ### Hacky memory trim
 import ctypes
@@ -1085,9 +1086,11 @@ class kymograph_cluster:
         df.to_hdf(self.kymographpath + "/temp_output/temp_output_" + str(fov_idx) + ".hdf", "data",mode="w",format="table")
 
         return fov_idx
-
+    
+		
     def get_filter_scores(self,channel,file_idx):
-        df = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
+        # df = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
+        df = dd.read_parquet(self.kymographpath + "/metadata")
 
         working_rowdfs = []
 
@@ -1117,7 +1120,9 @@ class kymograph_cluster:
         return out_df
 
     def get_all_filter_scores(self,channel,dask_controller):
-        df = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
+        # df = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
+        df = dd.read_parquet(self.kymographpath + "/metadata")
+
         file_list = df["File Index"].unique().compute().tolist()
         del df
 
@@ -1142,7 +1147,7 @@ class kymograph_cluster:
         ## compiling output dataframe ##
         df_out = dd.from_delayed(good_delayed).persist()
         df_out = df_out.repartition(partition_size="25MB").persist()
-        dd.to_parquet(df_out, self.kymographpath + "/metadata_2",engine='fastparquet',compression='gzip',write_metadata_file=True)
+        dd.to_parquet(df_out, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True)
         dask_controller.daskclient.cancel(df_out)
         shutil.rmtree(self.kymographpath + "/metadata")
 
@@ -1267,8 +1272,6 @@ class kymograph_cluster:
             dask_controller.futures["X In Bounds: " + str(fov_idx)] = future
 
         ### crop in x ###
-
-
         for k,file_idx in enumerate(file_list):
             working_filedf = filedf.loc[file_idx]
             fov_idx = working_filedf["fov"].unique().tolist()[0]
@@ -1282,6 +1285,7 @@ class kymograph_cluster:
             dask_controller.futures["X Crop: " + str(file_idx)] = future
 
         ### get coords ###
+        print('get coords')
         df_fov_idx_futures = []
         for k,fov_idx in enumerate(fov_list):
             working_fovdf = fovdf.loc[fov_idx]
@@ -1295,22 +1299,23 @@ class kymograph_cluster:
 
             df_fov_idx_future = dask_controller.daskclient.submit(self.save_coords,fov_idx,x_crop_futures,in_bounds_future,drift_orientation_and_initend_future,retries=0)
             df_fov_idx_futures.append(df_fov_idx_future)
-
+		
         while any(future.status == 'pending' for future in df_fov_idx_futures):
             sleep(0.1)
-
+		
         good_futures = []
         for future in df_fov_idx_futures:
             if future.status == 'finished':
                 good_futures.append(future.result())
-
+        print('coords done')
         temp_output_file_list = [self.kymographpath + "/temp_output/temp_output_" + str(fov_idx) + ".hdf" for fov_idx in sorted(good_futures)]
         df_out = dd.read_hdf(temp_output_file_list,"data",mode="r",sorted_index=True)
 
         ## compiling output dataframe ##
+        print('adding trenchids')
         df_out = self.add_trenchids(df_out).persist()
-        df_out = df_out.reset_index(drop=False).set_index("Temp File Parquet Index", drop=True, sorted=False).persist() #sorted=False) HERE
-
+        df_out = df_out.reset_index(drop=False).set_index("Temp File Parquet Index", drop=True, sort=False).persist() #sorted=False) HERE
+        
         successful_fovs = df_out["fov"].unique().compute().tolist()
 
         dd.to_parquet(df_out, self.kymographpath + "/metadata",engine='pyarrow',compression='gzip',write_metadata_file=True,overwrite=True)
@@ -1323,15 +1328,31 @@ class kymograph_cluster:
         else:
             ### compiling output dataframe ##
             #### Dirty fix
-            df_out = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
-            df_out = df_out.set_index("FOV Parquet Index",drop=True,sorted=False)
-            df_out = df_out.repartition(partition_size="25MB")
-            dd.to_parquet(df_out, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True)
+            # print('compiling output dataframe')
+            # df_out = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
+            # df_out = df_out.set_index("FOV Parquet Index",drop=True,sorted=False)
+            # df_out = df_out.repartition(partition_size="25MB")
+            # dd.to_parquet(df_out, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True)
+            # dask_controller.daskclient.cancel(df_out)
+            # shutil.rmtree(self.kymographpath + "/metadata")
+
+			###Claude fix
+            print('compiling output dataframe')
+            df_out = dd.read_parquet(self.kymographpath + "/metadata")  # remove calculate_divisions
+            print('setting FOV Parquet Index')
+            df_out = df_out.set_index("FOV Parquet Index", drop=True, sort=False)  # sorted → sort
+            print('Repartitioning')
+            df_out = df_out.repartition(partition_size="25MB").persist()  # add persist
+            wait(df_out)  # explicit wait before writing
+            print('Writing to parquet')
+            dd.to_parquet(df_out, self.kymographpath + "/metadata_2", engine='pyarrow', compression='gzip', write_metadata_file=True)
             dask_controller.daskclient.cancel(df_out)
             shutil.rmtree(self.kymographpath + "/metadata")
-
+			
         # Adding global row column
-        df_out = dd.read_parquet(self.kymographpath + "/metadata_2",calculate_divisions=True)
+        # df_out = dd.read_parquet(self.kymographpath + "/metadata_2",calculate_divisions=True)
+        df_out = dd.read_parquet(self.kymographpath + "/metadata_2")
+
         fov_row_timepoint_df = df_out.groupby(["fov","row","timepoints"],sort=False).first().compute()
         fov_timepoint_df = fov_row_timepoint_df.reset_index(drop=False).set_index(["fov","timepoints"]).sort_index()
 
@@ -1356,18 +1377,86 @@ class kymograph_cluster:
         dask_controller.daskclient.cancel([val for key,val in dask_controller.futures.items()])
         dask_controller.daskclient.run(trim_memory)
 
-    def add_trenchids(self,df):
+    # def add_trenchids(self,df):
 
+    #     trench_preindex = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}'), axis=1)
+    #     df["key"] = trench_preindex.persist()
+
+    #     trenchids = df.set_index("key",sorted=True).groupby("key").size().reset_index().drop(0,axis=1).reset_index().compute()
+    #     trenchids.columns = ["trenchid","key"]
+    #     df = df.join(trenchids.set_index('key'),how="left",on="key",rsuffix="moo")
+    #     del df["key"]
+
+    #     return df
+
+    # def add_trenchids(self,df):
+	   #  """
+	   #  Revised version to assign unique, sequential trenchids in a distributed manner
+	   #  without using a .compute() call in the middle of the operation.
+	   #  """
+	   #  # Create a unique key for each trench group (fov, row, trench)
+	   #  # This part of your logic is fine.
+	   #  trench_preindex = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}'), axis=1, meta=(None, 'int64'))
+	   #  df['key'] = trench_preindex
+	
+	   #  # Create a Dask DataFrame with unique trench IDs.
+	   #  # THIS IS THE KEY CHANGE: We do NOT use .compute() here.
+	   #  # We get a DataFrame of unique keys, drop duplicates, and calculate a global index.
+	   #  trenchids_df = df[['key']].drop_duplicates().persist()
+	   #  trenchids_df['trenchid'] = 1
+	   #  trenchids_df['trenchid'] = trenchids_df['trenchid'].cumsum() - 1
+	   #  trenchids_df = trenchids_df.persist()
+	
+	   #  # Perform a distributed merge instead of a join with a computed Pandas DataFrame.
+	   #  # Dask will handle the shuffle required for the merge efficiently.
+	   #  df = dd.merge(df, trenchids_df, on='key', how='left')
+	    
+	   #  # Clean up the temporary key column
+	   #  del df["key"]
+	
+	   #  return df
+
+
+    def add_trenchids(self, df):
+        # Create the key column as before
         trench_preindex = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}'), axis=1)
         df["key"] = trench_preindex.persist()
 
-        trenchids = df.set_index("key",sorted=True).groupby("key").size().reset_index().drop(0,axis=1).reset_index().compute()
-        trenchids.columns = ["trenchid","key"]
-        df = df.join(trenchids.set_index('key'),how="left",on="key",rsuffix="moo")
+        # Get unique keys efficiently without materializing the full dataset
+        unique_keys = df["key"].unique().compute()
+
+		###Claude
+        unique_keys_list = list(unique_keys)  # <-- This line was missing
+        is_sorted = unique_keys_list == sorted(unique_keys_list)
+        print(f"[add_trenchids] Number of unique keys: {len(unique_keys_list)}")
+        print(f"[add_trenchids] Keys already sorted: {is_sorted}")
+        print(f"[add_trenchids] First 10 keys (unsorted): {unique_keys_list[:10]}")
+        print(f"[add_trenchids] First 10 keys (sorted):   {sorted(unique_keys_list)[:10]}")
+    
+        if not is_sorted:
+            print(f"[add_trenchids] WARNING: Keys are NOT sorted! This would cause scrambled trenchids.")
+            # Find where first mismatch occurs
+            sorted_keys = sorted(unique_keys_list)
+            for i, (orig, srt) in enumerate(zip(unique_keys_list, sorted_keys)):
+                if orig != srt:
+                    print(f"[add_trenchids] First mismatch at index {i}: original={orig}, sorted={srt}")
+                    break
+    
+        # Apply the fix: sort unique keys
+        unique_keys = sorted(unique_keys_list)
+        print(f"[add_trenchids] After sorting, first 10 keys: {unique_keys[:10]}")
+
+        # Create trenchid mapping directly from unique keys
+        trenchid_mapping = pd.DataFrame({"key": unique_keys,
+										 "trenchid": range(len(unique_keys))}).set_index("key")
+
+        # Convert to dask and join
+        trenchid_mapping_dd = dd.from_pandas(trenchid_mapping, npartitions=1)
+        df = df.join(trenchid_mapping_dd, on="key")
         del df["key"]
 
         return df
-
+ 
 #     def add_list_to_column(self,df,list_to_add,column_name):
 #         df = df.repartition(partition_size="25MB").persist()
 #         df["index"] = 1
@@ -1387,7 +1476,7 @@ class kymograph_cluster:
     def filter_trenchids(self,dask_controller,channel,df,focus_threshold = 0.,intensity_threshold=0.,perc_above = 0.):
         num_above = np.round(len(df["timepoints"].unique().compute())*perc_above).astype(int)
 
-        trench_group = df.set_index("trenchid",sorted=True).groupby("trenchid")
+        trench_group = df.set_index("trenchid",sort=True).groupby("trenchid")
         trenchid_filter = trench_group.apply(lambda x: np.sum((x[channel + " Focus Score"]>focus_threshold)&(x[channel + " Mean Intensity"]>intensity_threshold))>=num_above).compute()
         trenchid_filter = pd.DataFrame({"trenchid filter":trenchid_filter})
         out_df = df.join(trenchid_filter, on='trenchid')
@@ -1395,61 +1484,199 @@ class kymograph_cluster:
         out_df = out_df.drop(labels="trenchid filter", axis=1)
         
         ## compiling output dataframe ##
-        dd.to_parquet(out_df, self.kymographpath + "/metadata_2",engine='fastparquet',compression='gzip',write_metadata_file=True)
+        dd.to_parquet(out_df, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True)
         dask_controller.daskclient.cancel(out_df)
         shutil.rmtree(self.kymographpath + "/metadata")
         os.rename(self.kymographpath + "/metadata_2", self.kymographpath + "/metadata")
     
-    def reindex_trenches(self,df):
+#     def reindex_trenches(self,df):
 
-        num_timepoints = len(df["timepoints"].unique())
-        fov_row_idx = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}'), axis=1)
-        df["fov-row Index"] = fov_row_idx.persist()
-        wait(df);
+#         num_timepoints = len(df["timepoints"].unique())
+#         fov_row_idx = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}'), axis=1)
+#         df["fov-row Index"] = fov_row_idx.persist()
+#         wait(df);
 
-        ### NEW ##
+#         ### NEW ##
 
-        new_trenches = df.set_index("fov-row Index",sorted=True)["trench"].persist()
-        wait(new_trenches);
-        new_trenches = new_trenches.groupby("fov-row Index").apply(lambda x: list(np.repeat(list(range(0,len(x.unique()))),repeats=num_timepoints))).persist()
-        wait(new_trenches);
-
-#         new_trenches = df.set_index("fov-row Index",sorted=True).groupby("fov-row Index").apply(lambda x: np.repeat(list(range(0,len(x["trench"].unique()))),repeats=num_timepoints))
+#         new_trenches = df.set_index("fov-row Index",sort=True)["trench"].persist()
 #         wait(new_trenches);
-        new_trenches = new_trenches.compute().sort_index()
-        new_trenches = new_trenches.apply(eval)
-        new_trenches = [element for list_ in new_trenches for element in list_]
-        new_trenches = pd.DataFrame(new_trenches)
-        df = df.drop(["trenchid","trench","fov-row Index"],axis=1)
-        new_trenches.index = df.index
+#         new_trenches = new_trenches.groupby("fov-row Index").apply(lambda x: list(np.repeat(list(range(0,len(x.unique()))),repeats=num_timepoints))).persist()
+#         wait(new_trenches);
 
-        new_trenches_dask_df = dd.from_pandas(new_trenches,npartitions=df.npartitions).persist()
-        wait(new_trenches_dask_df);
-        new_trenches_dask_df = new_trenches_dask_df.repartition(divisions=df.divisions)
-        # new_trenches_dask_df = new_trenches_dask_df.repartition(divisions=df.divisions,force=True)
-        new_trenches_dask_df = new_trenches_dask_df.persist()
-        wait(new_trenches_dask_df);
-        df["trench"] = new_trenches_dask_df[0]
+# #         new_trenches = df.set_index("fov-row Index",sorted=True).groupby("fov-row Index").apply(lambda x: np.repeat(list(range(0,len(x["trench"].unique()))),repeats=num_timepoints))
+# #         wait(new_trenches);
+#         new_trenches = new_trenches.compute().sort_index()
+#         new_trenches = new_trenches.apply(eval)
+#         new_trenches = [element for list_ in new_trenches for element in list_]
+#         new_trenches = pd.DataFrame(new_trenches)
+#         df = df.drop(["trenchid","trench","fov-row Index"],axis=1)
+#         new_trenches.index = df.index
 
+#         new_trenches_dask_df = dd.from_pandas(new_trenches,npartitions=df.npartitions).persist()
+#         wait(new_trenches_dask_df);
+#         # new_trenches_dask_df = new_trenches_dask_df.repartition(divisions=df.divisions)
+#         # new_trenches_dask_df = new_trenches_dask_df.repartition(divisions=df.divisions,force=True)
+# 		#Claude
+#         new_trenches_dask_df = new_trenches_dask_df.repartition(npartitions=df.npartitions)
+#         new_trenches_dask_df = new_trenches_dask_df.persist()
+#         wait(new_trenches_dask_df);
+#         df["trench"] = new_trenches_dask_df[0]
+
+#         cols = df.columns.tolist()
+#         reordered_columns = cols[:2] + cols[-1:] + cols[2:-1]
+#         df = df[reordered_columns]
+
+#         ## NEW CODE ##
+#         fov_idx = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}{x["timepoints"]:04n}'), axis=1)
+#         df["FOV Parquet Index"] = fov_idx.persist()
+#         wait(df);
+
+#         df = df.set_index("FOV Parquet Index")
+#         return df
+
+    ###Claude
+    # def reindex_trenches(self, df):
+    #     num_timepoints = len(df["timepoints"].unique())
+    #     print(f"num_timepoints: {num_timepoints}")
+    
+    #     # Compute to pandas
+    #     pdf = df.compute()
+    #     print(f"After compute: {len(pdf)} rows")
+    
+    #     # Create fov-row index
+    #     pdf["fov-row Index"] = pdf.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}'), axis=1)
+    #     print(f"Unique fov-row groups: {pdf['fov-row Index'].nunique()}")
+    
+    #     # Sort
+    #     pdf = pdf.sort_values(["fov-row Index", "trench", "timepoints"]).reset_index(drop=True)
+    #     print(f"After sort: {len(pdf)} rows")
+    
+    #     # Check a sample before transform
+    #     sample_group = pdf["fov-row Index"].iloc[0]
+    #     sample_before = pdf[pdf["fov-row Index"] == sample_group][["fov", "row", "trench", "timepoints"]].head(20)
+    #     print(f"Sample group {sample_group} before transform:")
+    #     print(sample_before)
+    
+    #     # Create new trench indices
+    #     pdf["trench_rank"] = pdf.groupby("fov-row Index")["trench"].transform(
+    #         lambda x: pd.factorize(x)[0]
+    #     )
+    
+    #     # Check sample after transform
+    #     # sample_after = pdf[pdf["fov-row Index"] == sample_group][["fov", "row", "trench", "trench_rank", "timepoints"]].head(20)
+    #     # print(f"Sample group {sample_group} after transform:")
+    #     # print(sample_after)
+    
+    #     # # Check trench_rank distribution
+    #     # print(f"trench_rank min: {pdf['trench_rank'].min()}, max: {pdf['trench_rank'].max()}")
+    
+    #     # # Verify each (fov-row, trench_rank) has correct timepoints
+    #     # check = pdf.groupby(["fov-row Index", "trench_rank"])["timepoints"].count()
+    #     # print(f"Timepoints per (fov-row, trench_rank):")
+    #     # print(check.describe())
+    #     # print(check.value_counts().head())
+    
+    #     # Continue with rest of function...
+    #     pdf = pdf.drop(["trenchid", "trench", "fov-row Index"], axis=1, errors='ignore')
+    #     pdf = pdf.rename(columns={"trench_rank": "trench"})
+    
+    #     cols = pdf.columns.tolist()
+    #     trench_idx = cols.index("trench")
+    #     cols.insert(2, cols.pop(trench_idx))
+    #     pdf = pdf[cols]
+    
+    #     pdf["FOV Parquet Index"] = pdf.apply(
+    #         lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}{x["timepoints"]:04n}'), axis=1
+    #     )
+    
+    #     pdf = pdf.set_index("FOV Parquet Index")
+    
+    #     # Final check
+    #     # final_check = pdf.reset_index().groupby(["fov", "row", "trench"])["timepoints"].count()
+    #     # print(f"Final timepoints per (fov, row, trench):")
+    #     # print(final_check.describe())
+    #     # print(final_check.value_counts().head())
+    
+    #     df = dd.from_pandas(pdf, npartitions=max(1, len(pdf) // 100000))
+    
+    #     return df
+    def reindex_trenches(self, df):
+        num_timepoints = len(df["timepoints"].unique().compute())
+        print(f"num_timepoints: {num_timepoints}")
+
+        # Create fov-row index as a dask operation
+        df["fov-row Index"] = df.apply(
+            lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}'), 
+            axis=1, 
+            meta=('fov-row Index', int)
+        )
+    
+        # Get unique (fov-row, trench) combinations - MUCH smaller than full df
+        # Sort them the same way the original does
+        unique_combos = df[["fov-row Index", "trench"]].drop_duplicates().compute()
+        unique_combos = unique_combos.sort_values(["fov-row Index", "trench"]).reset_index(drop=True)
+        print(f"Unique (fov-row, trench) combinations: {len(unique_combos)}")
+    
+        # Create trench rank - factorize without sort=True, but data is already sorted
+        # so this matches original behavior
+        unique_combos["trench_rank"] = unique_combos.groupby("fov-row Index")["trench"].transform(
+            lambda x: pd.factorize(x)[0]
+        )
+    
+        # Convert to dask for merge
+        unique_combos_dd = dd.from_pandas(
+            unique_combos[["fov-row Index", "trench", "trench_rank"]], 
+            npartitions=1
+        )
+    
+        # Merge to get trench_rank for all rows
+        df = df.merge(unique_combos_dd, on=["fov-row Index", "trench"], how="left")
+    
+        # Drop and rename columns
+        df = df.drop(["trenchid", "trench", "fov-row Index"], axis=1, errors='ignore')
+        df = df.rename(columns={"trench_rank": "trench"})
+    
+        # Reorder columns to put trench in position 2
         cols = df.columns.tolist()
-        reordered_columns = cols[:2] + cols[-1:] + cols[2:-1]
-        df = df[reordered_columns]
-
-        ## NEW CODE ##
-        fov_idx = df.apply(lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}{x["timepoints"]:04n}'), axis=1)
-        df["FOV Parquet Index"] = fov_idx.persist()
-        wait(df);
-
-        df = df.set_index("FOV Parquet Index")
+        if "trench" in cols:
+            trench_idx = cols.index("trench")
+            cols.insert(2, cols.pop(trench_idx))
+            df = df[cols]
+    
+        # Create FOV Parquet Index
+        df["FOV Parquet Index"] = df.apply(
+            lambda x: int(f'{x["fov"]:04n}{x["row"]:04n}{x["trench"]:04n}{x["timepoints"]:04n}'),
+            axis=1,
+            meta=('FOV Parquet Index', int)
+        )
+    
+        df = df.set_index("FOV Parquet Index", sort=True)
+    
         return df
 
     def reorg_kymograph(self,k,trenchids):
 #         df = dd.read_parquet(self.kymographpath + "/metadata/")
 #         trenchid_list = df["trenchid"].unique().compute().tolist()
 #         trenchiddf = df.set_index("trenchid")
-        working_trenchdf = dd.read_parquet(self.kymographpath + "/trenchiddf",calculate_divisions=True).loc[trenchids].compute(scheduler='threads')
-        working_trenchdf = working_trenchdf.sort_values(["fov","File Index","row"])
-        output_file_path = self.kymographpath+"/kymograph_"+str(k)+".hdf5"
+        # working_trenchdf = dd.read_parquet(self.kymographpath + "/trenchiddf",calculate_divisions=True).loc[trenchids].compute(scheduler='threads')
+        #Claude
+        # working_trenchdf = dd.read_parquet(self.kymographpath + "/trenchiddf")
+        # working_trenchdf = working_trenchdf[working_trenchdf.index.isin(trenchids)].compute(scheduler='threads')
+        trenchids_list = list(trenchids)
+    
+        # Use pyarrow dataset for efficient filtered reading
+        dataset = ds.dataset(self.kymographpath + "/trenchiddf", format="parquet")
+    
+        # Filter at read time - only loads matching rows from disk
+        table = dataset.to_table(filter=ds.field("trenchid").isin(trenchids_list))
+        working_trenchdf = table.to_pandas()
+    
+        # Set index if needed (parquet often saves index as column)
+        if "trenchid" in working_trenchdf.columns:
+            working_trenchdf = working_trenchdf.set_index("trenchid")
+    
+        working_trenchdf = working_trenchdf.sort_values(["fov", "File Index", "row"])
+        output_file_path = self.kymographpath + "/kymograph_" + str(k) + ".hdf5"
 
         with h5py.File(output_file_path,"w") as outfile:
             for channel in self.all_channels:
@@ -1472,7 +1699,8 @@ class kymograph_cluster:
 #                                 trenches = working_rowdf["trench"].unique().tolist()
 #                                 first_trench_idx,last_trench_idx = (trenches[0],trenches[-1])
 #                                 kymo_arr = infile[str(row) + "/" + channel][first_trench_idx:(last_trench_idx+1)]
-                                trenches = working_rowdf["trench"].unique().tolist()
+                                # trenches = working_rowdf["trench"].unique().tolist()
+                                trenches = sorted(working_rowdf["trench"].unique().tolist())
                                 kymo_arr = infile[str(row) + "/" + channel][trenches]
                                 trench_arr_rows.append(kymo_arr)
                         trench_arr_rows = np.concatenate(trench_arr_rows,axis=0) # k x t x y x x
@@ -1488,12 +1716,14 @@ class kymograph_cluster:
             os.remove(proc_file_path)
         return 1
 
-    def post_process(self,dask_controller,trench_timepoints_per_file=25000,focus_thr=0,intensity_thr=0,perc_above_thr=0,filter_channel=None):
+    def post_process(self, dask_controller, trench_timepoints_per_file=25000, focus_thr=0, intensity_thr=0, perc_above_thr=0, filter_channel=None):
 
         dask_controller.futures = {}
 
-        outputdf = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
-
+        outputdf = dd.read_parquet(self.kymographpath + "/metadata")
+        outputdf = outputdf.persist()
+        wait(outputdf)
+    
         if os.path.exists(self.headpath + "/focus_filter.par"):
             with open(self.headpath + "/focus_filter.par", 'rb') as infile:
                 param_dict = pickle.load(infile)
@@ -1504,144 +1734,157 @@ class kymograph_cluster:
             perc_above_thr = param_dict["Percent Of Kymograph"]
 
             if filter_channel != None:
-                self.filter_trenchids(dask_controller,filter_channel,outputdf,focus_threshold=focus_thr,\
-                                      intensity_threshold=intensity_thr,perc_above=perc_above_thr)
-                outputdf = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
-        
+                self.filter_trenchids(dask_controller, filter_channel, outputdf, focus_threshold=focus_thr, intensity_threshold=intensity_thr, perc_above=perc_above_thr)
+                outputdf = dd.read_parquet(self.kymographpath + "/metadata")
+                outputdf = outputdf.persist()
+                wait(outputdf)
+            
         if os.path.exists(self.kymographpath + "/global_rows.pkl"):
             print("Eliminating selected rows...")
             with open(self.kymographpath + "/global_rows.pkl", 'rb') as handle:
                 rows_to_keep = pkl.load(handle)
-            outputdf = outputdf[outputdf["Global Row"].apply(lambda x: x in rows_to_keep, meta=('Global Row',bool))]
+            outputdf = outputdf[outputdf["Global Row"].apply(lambda x: x in rows_to_keep, meta=('Global Row', bool))]
 
             fov_to_rows_series = outputdf.groupby("fov")["row"].apply(lambda x: sorted(list(set(x)))).compute().sort_index()
             fov_to_rows_series = fov_to_rows_series.apply(eval)
-            
-            fov_to_rows_map = fov_to_rows_series.apply(lambda x: {old_row:new_row for new_row,old_row in enumerate(sorted(x))}).to_frame().reset_index()
-            fov_to_rows_map = fov_to_rows_map.apply(lambda x: {(x["fov"],key):val for key,val in x["row"].items()}, axis=1).tolist()
+        
+            fov_to_rows_map = fov_to_rows_series.apply(lambda x: {old_row: new_row for new_row, old_row in enumerate(sorted(x))}).to_frame().reset_index()
+            fov_to_rows_map = fov_to_rows_map.apply(lambda x: {(x["fov"], key): val for key, val in x["row"].items()}, axis=1).tolist()
             fov_to_rows_map = {k: v for d in fov_to_rows_map for k, v in d.items()}
 
-            outputdf["new row"] = outputdf.apply(lambda x: int(fov_to_rows_map[(x["fov"],x["row"])]), axis=1, meta=("new row", int))
+            outputdf["new row"] = outputdf.apply(lambda x: int(fov_to_rows_map[(x["fov"], x["row"])]), axis=1, meta=("new row", int))
             outputdf = outputdf.reset_index(drop=True)
             outputdf["FOV Parquet Index"] = outputdf.apply(lambda x: int(f'{x["fov"]:04n}{x["new row"]:04n}{x["trench"]:04n}{x["timepoints"]:04n}'), axis=1, meta=("FOV Parquet Index", int))
-            outputdf = outputdf.set_index("FOV Parquet Index",sorted=True)
+            outputdf = outputdf.set_index("FOV Parquet Index", sort=True)
 
-            dd.to_parquet(outputdf, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True,schema="infer")
+            dd.to_parquet(outputdf, self.kymographpath + "/metadata_2", engine='pyarrow', compression='gzip', write_metadata_file=False, schema="infer")
             dask_controller.daskclient.cancel(outputdf)
             shutil.rmtree(self.kymographpath + "/metadata")
             os.rename(self.kymographpath + "/metadata_2", self.kymographpath + "/metadata")
             sleep(self.o2_file_rename_latency)
 
-            outputdf = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
-
-        trenchid_list = outputdf["trenchid"].unique().compute().tolist()
+        outputdf = dd.read_parquet(self.kymographpath + "/metadata")
+        outputdf = outputdf.persist()
+        wait(outputdf)
+    
+        # CRITICAL: Sort trenchid_list for deterministic ordering (Dask 2025 fix)
+        trenchid_list = sorted(outputdf["trenchid"].unique().compute().tolist())
+    
         file_list = outputdf["File Index"].unique().compute().tolist()
 
-        trenchiddf = outputdf.set_index("trenchid",sorted=False).persist()
-        wait(trenchiddf);
-        outputdf = outputdf.drop(columns = ["File Index","Image Index"]).persist()
-        wait(outputdf);
-
-#         writedir(self.kymographpath + "/metadata",overwrite=True)
+        trenchiddf = outputdf.set_index("trenchid", sort=False).persist()
+        wait(trenchiddf)
+    
+        outputdf = outputdf.drop(columns=["File Index", "Image Index"]).persist()
+        wait(outputdf)
+    
+        # Compute length explicitly before using it
+        outputdf_len = outputdf.shape[0].compute()
 
         num_tpts = len(trenchiddf["timepoints"].unique().compute().tolist())
-        trenches_per_file = trench_timepoints_per_file//num_tpts
-        chunk_size = trenches_per_file*num_tpts
+        trenches_per_file = trench_timepoints_per_file // num_tpts
+        chunk_size = trenches_per_file * num_tpts
 
         print("Number of timepoints per trench: " + str(num_tpts))
         print("Number of trenches per file: " + str(trenches_per_file))
 
-        if len(trenchid_list)%trenches_per_file == 0:
-            num_files = (len(trenchid_list)//trenches_per_file)
+        if len(trenchid_list) % trenches_per_file == 0:
+            num_files = (len(trenchid_list) // trenches_per_file)
         else:
-            num_files = (len(trenchid_list)//trenches_per_file) + 1
+            num_files = (len(trenchid_list) // trenches_per_file) + 1
 
-        file_indices = np.repeat(np.array(range(num_files)),chunk_size)[:len(outputdf)]
-        file_trenchid = np.repeat(np.array(range(trenches_per_file)),num_tpts)
-        file_trenchid = np.repeat(file_trenchid[:,np.newaxis],num_files,axis=1).T.flatten()[:len(outputdf)]
+        file_indices = np.repeat(np.array(range(num_files)), chunk_size)[:outputdf_len]
+        file_trenchid = np.repeat(np.array(range(trenches_per_file)), num_tpts)
+        file_trenchid = np.repeat(file_trenchid[:, np.newaxis], num_files, axis=1).T.flatten()[:outputdf_len]
+    
         file_indices = pd.DataFrame(file_indices)
         file_trenchid = pd.DataFrame(file_trenchid)
         file_indices.index = outputdf.index
         file_trenchid.index = outputdf.index
 
-        #test code
-        file_indices_dask_df = dd.from_pandas(file_indices,npartitions=outputdf.npartitions).persist()
-        wait(file_indices_dask_df);
-        # file_indices_dask_df = file_indices_dask_df.repartition(divisions=outputdf.divisions)
-        file_indices_dask_df = file_indices_dask_df.repartition(divisions=outputdf.divisions,force=True)
+        file_indices_dask_df = dd.from_pandas(file_indices, npartitions=outputdf.npartitions).persist()
+        wait(file_indices_dask_df)
+        file_indices_dask_df = file_indices_dask_df.repartition(npartitions=outputdf.npartitions)
         file_indices_dask_df = file_indices_dask_df.persist()
-        wait(file_indices_dask_df);
+        wait(file_indices_dask_df)
         outputdf["File Index"] = file_indices_dask_df[0]
-        #test code
-        file_trenchid_dask_df = dd.from_pandas(file_trenchid,npartitions=outputdf.npartitions).persist()
-        wait(file_trenchid_dask_df);
-        # file_trenchid_dask_df = file_trenchid_dask_df.repartition(divisions=outputdf.divisions)
-        file_trenchid_dask_df = file_trenchid_dask_df.repartition(divisions=outputdf.divisions,force=True)
+    
+        file_trenchid_dask_df = dd.from_pandas(file_trenchid, npartitions=outputdf.npartitions).persist()
+        wait(file_trenchid_dask_df)
+        file_trenchid_dask_df = file_trenchid_dask_df.repartition(npartitions=outputdf.npartitions)
         file_trenchid_dask_df = file_trenchid_dask_df.persist()
-        wait(file_trenchid_dask_df);
+        wait(file_trenchid_dask_df)
         outputdf["File Trench Index"] = file_trenchid_dask_df[0]
         outputdf = outputdf.persist()
-        wait(outputdf);
-
-##         outputdf = add_list_to_column(outputdf,file_indices[0].tolist(),"File Index").persist()
-##         wait(outputdf);
-#         outputdf = add_list_to_column(outputdf,file_trenchid[0].tolist(),"File Trench Index").persist()
-#         wait(outputdf);
+        wait(outputdf)
 
         parq_file_idx = outputdf.apply(lambda x: int(f'{int(x["File Index"]):08n}{int(x["File Trench Index"]):04n}{int(x["timepoints"]):04n}'), axis=1, meta=int)
         outputdf["File Parquet Index"] = parq_file_idx.persist()
-        outputdf = outputdf.astype({"File Index":int,"File Trench Index":int,"File Parquet Index":int}).persist()
-        wait(outputdf);
+        outputdf = outputdf.astype({"File Index": int, "File Trench Index": int, "File Parquet Index": int}).persist()
+        wait(outputdf)
 
-        dd.to_parquet(trenchiddf, self.kymographpath + "/trenchiddf",engine='fastparquet',compression='gzip',write_metadata_file=True)
+        dd.to_parquet(trenchiddf, self.kymographpath + "/trenchiddf", engine='pyarrow', compression='gzip', write_metadata_file=False)
         del trenchiddf
 
         random_priorities = np.random.uniform(size=(num_files,))
-        for k in range(0,num_files):
+        for k in range(0, num_files):
             priority = random_priorities[k]
-
-            trenchids = trenchid_list[k*trenches_per_file:(k+1)*trenches_per_file]
-
-            future = dask_controller.daskclient.submit(self.reorg_kymograph,k,trenchids,retries=1,priority=priority)
+            trenchids = trenchid_list[k * trenches_per_file:(k + 1) * trenches_per_file]
+            future = dask_controller.daskclient.submit(self.reorg_kymograph, k, trenchids, retries=1, priority=priority)
             dask_controller.futures["Kymograph Reorganized: " + str(k)] = future
 
         reorg_futures = [dask_controller.futures["Kymograph Reorganized: " + str(k)] for k in range(num_files)]
-        future = dask_controller.daskclient.submit(self.cleanup_kymographs,reorg_futures,file_list,retries=1,priority=priority)
+        future = dask_controller.daskclient.submit(self.cleanup_kymographs, reorg_futures, file_list, retries=1, priority=priority)
         dask_controller.futures["Kymographs Cleaned Up"] = future
         dask_controller.daskclient.gather([future])
 
         if os.path.exists(self.kymographpath + "/global_rows.pkl"):
-            outputdf = outputdf.drop("row",axis=1)
-            outputdf = outputdf.rename(columns={"new row":"row"})
+            outputdf = outputdf.drop("row", axis=1)
+            outputdf = outputdf.rename(columns={"new row": "row"})
 
-        #checkpoint
-        dd.to_parquet(outputdf, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True,schema="infer")
+        # Checkpoint to clear task graph before expensive operations
+        print("Checkpointing before reindex_trenches...")
+        dd.to_parquet(outputdf, self.kymographpath + "/metadata_2", engine='pyarrow', compression='gzip', write_metadata_file=False, schema="infer")
         dask_controller.daskclient.cancel(outputdf)
         shutil.rmtree(self.kymographpath + "/metadata")
         os.rename(self.kymographpath + "/metadata_2", self.kymographpath + "/metadata")
         sleep(self.o2_file_rename_latency)
-        outputdf = dd.read_parquet(self.kymographpath + "/metadata",calculate_divisions=True)
+    
+        # Read fresh to clear task graph
+        outputdf = dd.read_parquet(self.kymographpath + "/metadata")
+        outputdf = outputdf.persist()
+        wait(outputdf)
 
-        ## everything after this is slow
-
+        print("Running reindex_trenches...")
         outputdf = self.reindex_trenches(outputdf).persist()
-        wait(outputdf);
+        wait(outputdf)
+    
+        print("Running add_trenchids...")
         outputdf = self.add_trenchids(outputdf).persist()
-        wait(outputdf);
+        wait(outputdf)
 
         ### NEW INDEX
         outputdf["Trenchid Timepoint Index"] = outputdf.apply(lambda x: int(f'{x["trenchid"]:08n}{x["timepoints"]:04n}'), axis=1, meta=int)
         outputdf["Trenchid Timepoint Index"] = outputdf["Trenchid Timepoint Index"].astype(int)
         ### END
-        outputdf = outputdf.drop(labels=["FOV Parquet Index"],axis=1)
-        dd.to_parquet(outputdf, self.kymographpath + "/metadata_2",engine='pyarrow',compression='gzip',write_metadata_file=True,schema="infer")
+    
+        # FOV Parquet Index is already the index, not a column - just reset it if needed
+        if "FOV Parquet Index" in outputdf.columns:
+            outputdf = outputdf.drop(labels=["FOV Parquet Index"], axis=1)
+    
+        # Final write
+        dd.to_parquet(outputdf, self.kymographpath + "/metadata_2", engine='pyarrow', compression='gzip', write_metadata_file=False, schema="infer")
         dask_controller.daskclient.cancel(outputdf)
         shutil.rmtree(self.kymographpath + "/metadata")
         os.rename(self.kymographpath + "/metadata_2", self.kymographpath + "/metadata")
         shutil.rmtree(self.kymographpath + "/trenchiddf")
+    
+        print("post_process complete!")
 
     def kymo_report(self):
-        df = dd.read_parquet(self.kymographpath + "/metadata/",calculate_divisions=True).persist()
+        # df = dd.read_parquet(self.kymographpath + "/metadata/",calculate_divisions=True).persist()
+        df = dd.read_parquet(self.kymographpath + "/metadata/").persist()
+
         with open(self.kymographpath + "/metadata.pkl", 'rb') as handle:
             metadata = pickle.load(handle)
 
@@ -1659,7 +1902,7 @@ class kymograph_cluster:
         print("trenches/fov: " + str(trenches_proc/fovs_proc))
 
         print("failed fovs: " + str(failed_fovs))
-
+	
 class kymograph_multifov(multifov):
     def __init__(self,headpath):
         """The kymograph class is used to generate and visualize kymographs.

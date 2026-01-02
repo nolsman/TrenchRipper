@@ -89,10 +89,10 @@ class kymograph_interactive(kymograph_multifov):
 
     def preview_y_precentiles_interactive(self):
         row_detection = interactive(self.preview_y_precentiles, {"manual":True},\
-                        imported_array_list=fixed(self.imported_array_list), y_percentile=IntSlider(value=99,\
-                        min=0, max=100, step=1), y_foreground_percentile=IntSlider(value=80,min=0, max=100, step=1),\
-                        smoothing_kernel_y_dim_0=IntSlider(value=29, min=1,max=200, step=2),\
-                        y_percentile_threshold=FloatSlider(value=0.2, min=0., max=1., step=0.01))
+                        imported_array_list=fixed(self.imported_array_list), y_percentile=IntSlider(value=95,\
+                        min=0, max=100, step=1), y_foreground_percentile=IntSlider(value=65,min=0, max=100, step=1),\
+                        smoothing_kernel_y_dim_0=IntSlider(value=51, min=1,max=200, step=2),\
+                        y_percentile_threshold=FloatSlider(value=0.5, min=0., max=1., step=0.01))
         display(row_detection)
 
     def plot_y_precentiles(self,y_percentiles_smoothed_list,selected_fov_list,y_percentile_threshold):
@@ -274,13 +274,14 @@ class kymograph_interactive(kymograph_multifov):
                 y_min_edge_dist=IntSlider(value=50, min=5, max=1000, step=5),\
                 midpoint_dist_tolerence=IntSlider(value=50, min=5, max=500, step=5),\
                 padding_y=IntSlider(value=20, min=0, max=500, step=5),\
-                trench_len_y=IntSlider(value=270, min=0, max=1000, step=5),
-                expected_num_rows=IntText(value=2,description='Number of Rows:',disabled=False),\
+                trench_len_y=IntSlider(value=130, min=0, max=1000, step=5),
+                expected_num_rows=IntText(value=10,description='Number of Rows:',disabled=False),\
                 alternate_orientation=Dropdown(options=[True,False],value=True,description='Alternate Orientation?:',disabled=False),\
-               orientation_detection=Dropdown(options=[0, 1],value=0,description='Orientation:',disabled=False),\
+               orientation_detection=Dropdown(options=[0, 1],value=1,description='Orientation:',disabled=False),\
                 alternate_over_rows=Dropdown(options=[True,False],value=False,description='Alternate Orientation Over Rows?:',disabled=False),\
                 use_median_drift=Dropdown(options=[True,False],value=False,description='Use Median Drift?:',disabled=False),\
                     images_per_row=IntSlider(value=3, min=1, max=10, step=1))
+
 
         display(y_cropping)
 
@@ -356,8 +357,8 @@ class kymograph_interactive(kymograph_multifov):
 
     def preview_x_percentiles_interactive(self):
         trench_detection = interactive(self.preview_x_percentiles, {"manual":True}, cropped_in_y_list=fixed(self.cropped_in_y_list),t=IntSlider(value=0, min=0, max=self.cropped_in_y_list[0].shape[4]-1, step=1),\
-                x_percentile=IntSlider(value=85, min=50, max=100, step=1),background_kernel_x=IntSlider(value=21, min=1, max=601, step=5), smoothing_kernel_x=IntSlider(value=9, min=1, max=31, step=2),\
-               otsu_scaling=FloatSlider(value=0.25, min=0., max=2., step=0.01),min_threshold=IntSlider(value=0, min=0., max=65535, step=1));
+                x_percentile=IntSlider(value=85, min=50, max=100, step=1),background_kernel_x=IntSlider(value=51, min=1, max=601, step=5), smoothing_kernel_x=IntSlider(value=5, min=1, max=31, step=2),\
+               otsu_scaling=FloatSlider(value=0., min=0., max=2., step=0.01),min_threshold=IntSlider(value=150, min=0., max=65535, step=1));
 
         display(trench_detection)
 
@@ -428,8 +429,8 @@ class kymograph_interactive(kymograph_multifov):
 
     def preview_kymographs_interactive(self):
             interact_manual(self.preview_kymographs,cropped_in_y_list=fixed(self.cropped_in_y_list),all_midpoints_list=fixed(self.all_midpoints_list),\
-            x_drift_list=fixed(self.x_drift_list),trench_width_x=IntSlider(value=30, min=2, max=1000, step=2),\
-            trench_present_thr=FloatSlider(value=0., min=0., max=1., step=0.05),\
+            x_drift_list=fixed(self.x_drift_list),trench_width_x=IntSlider(value=20, min=2, max=1000, step=2),\
+            trench_present_thr=FloatSlider(value=0.8, min=0., max=1., step=0.05),\
             use_median_drift=Dropdown(options=[True,False],value=False,description='Use Median Drift?:',disabled=False))
 
     def plot_kymographs(self,cropped_in_x_list,selected_fov_list):
@@ -805,7 +806,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
             self.plot_processed,
             {"manual": True},
             bit_max=IntSlider(
-                value=1000,
+                value=1250,
                 description="8-bit Maximum:",
                 min=0,
                 max=65535,
@@ -887,7 +888,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
             local_thr=Dropdown(options=["otsu","niblack","none"],value="otsu"),
             background_thr=Dropdown(options=["triangle","yen","object-based","none"],value="triangle"),
             global_threshold=IntSlider(
-                value=50,
+                value=0,
                 description="Global Threshold:",
                 min=0,
                 max=255,
@@ -895,7 +896,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
                 disabled=False,
             ),
             window_size=IntSlider(
-                value=15,
+                value=9,
                 description="Window Size:",
                 min=0,
                 max=70,
@@ -927,7 +928,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
                 disabled=False,
             ),
             min_obj_size=IntSlider(
-                value=30,
+                value=20,
                 description="Minimum Object Size:",
                 min=0,
                 max=400,
@@ -968,9 +969,9 @@ class fluo_segmentation_interactive(fluo_segmentation):
         cell_eig_list_int = interactive(
             self.plot_eig_mask,
             {"manual": True},
-            eig_local_thr=Dropdown(options=["otsu","niblack"],value="niblack"),
+            eig_local_thr=Dropdown(options=["otsu","niblack"],value="otsu"),
             eig_sigma=FloatSlider(
-                value=2.,
+                value=1.5,
                 description="Hessian Blur Sigma:",
                 min=0.0,
                 max=5.0,
@@ -986,7 +987,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
                 disabled=False,
             ),
             eig_ball_radius=IntSlider(
-                value=20,
+                value=10,
                 description="Hessian Rolling Ball Radius:",
                 min=0,
                 max=100,
@@ -1002,7 +1003,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
                 disabled=False,
             ),
             eig_niblack_k=FloatSlider(
-                value=0.05,
+                value=0.15,
                 description="Hessian Niblack K:",
                 min=0.0,
                 max=1.0,
@@ -1032,7 +1033,7 @@ class fluo_segmentation_interactive(fluo_segmentation):
             self.plot_dist_mask,
             {"manual": True},
             distance_threshold=IntSlider(
-                value=2,
+                value=1,
                 description="Distance Threshold:",
                 min=0,
                 max=20,

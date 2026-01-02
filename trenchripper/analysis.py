@@ -17,6 +17,9 @@ import panel as pn
 import scipy as sp
 import scipy.stats
 
+from collections import Counter
+from dask.distributed import wait
+
 from distributed.client import futures_of
 from time import sleep
 
@@ -174,7 +177,8 @@ class regionprops_extractor:
         return df_out
 
     def analyze_all_files(self,dask_cont):
-        df = dd.read_parquet(self.metapath,calculate_divisions=True)
+        print("Beginning Region Props Extraction")
+        df = dd.read_parquet(self.metapath)
         file_list = df["File Index"].unique().compute().tolist()
 #         kymo_meta = dd.read_parquet(self.metapath)
 #         file_list = kymo_meta["File Index"].unique().tolist()
@@ -188,39 +192,85 @@ class regionprops_extractor:
         all_delayed_futures = []
         for item in delayed_list:
             all_delayed_futures += futures_of(item)
+        # while any(future.status == "pending" for future in all_delayed_futures):
+        #     sleep(0.1)
+		###Claude
+        total = len(all_delayed_futures)
         while any(future.status == "pending" for future in all_delayed_futures):
-            sleep(0.1)
-
+            statuses = Counter(f.status for f in all_delayed_futures)
+            print(f"Progress: {statuses.get('finished', 0)}/{total} finished, {statuses.get('error', 0)} errors", end="\r")
+            sleep(5)
+        print()
         good_delayed = []
         for item in delayed_list:
             if all([future.status == "finished" for future in futures_of(item)]):
                 good_delayed.append(item)
-
-        ## compiling output dataframe ##
+	
+        ## compiling output dataframe 
+        print("1. Creating dataframe from delayed...")
         df_out = dd.from_delayed(good_delayed).persist()
-        df_out["File Parquet Index"] = df_out.index
-        df_out = df_out.set_index("File Parquet Index", drop=True, sorted=False)
-        df_out = df_out.repartition(partition_size="25MB").persist()
+        print(f"   Done. Partitions: {df_out.npartitions}")
 
-        kymo_df = dd.read_parquet(self.metapath,calculate_divisions=True)
+        print("2. Setting File Parquet Index column...")
+        df_out["File Parquet Index"] = df_out.index
+        print("   Done.")
+
+        print("3. Setting index...")
+        df_out = df_out.set_index("File Parquet Index", drop=True, sort=False)
+        df_out = df_out.persist()
+        wait(df_out)
+        print("   Done.")
+
+        print("4. Repartitioning...")
+        df_out = df_out.repartition(partition_size="25MB").persist()
+        wait(df_out)
+        print(f"   Done. New partitions: {df_out.npartitions}")
+
+        print("5. Reading kymo metadata...")
+
+        kymo_df = dd.read_parquet(self.metapath)
+        print("   Done.")
+
+        print("6. Preparing kymo_df for join...")
+
         kymo_df["File Merge Index"] = kymo_df["File Parquet Index"]
-        kymo_df = kymo_df.set_index("File Merge Index", sorted=True)
+        kymo_df = kymo_df.set_index("File Merge Index", sort=True)
         kymo_df = kymo_df.drop(["File Index","File Trench Index","timepoints","File Parquet Index"], axis=1)
+        kymo_df = kymo_df.persist()
+        wait(kymo_df)
+        print("   Done.")
+
+
+        print("7. Preparing df_out for join...")
 
         df_out["File Merge Index"] = df_out.apply(lambda x: int(f'{x["File Index"]:08n}{x["File Trench Index"]:04n}{x["timepoints"]:04n}'), axis=1)
         df_out = df_out.reset_index(drop=True)
-        df_out = df_out.set_index("File Merge Index", sorted=True)
+        df_out = df_out.set_index("File Merge Index", sort=True)
+        df_out = df_out.persist()
+        wait(df_out)
+        print("   Done.")
 
+        print("8. Joining dataframes...")
         df_out = df_out.join(kymo_df)
-        df_out = df_out.set_index("File Parquet Index",sorted=True)
+        df_out = df_out.persist()
+        wait(df_out)
+        print("   Done.")
 
+        print("9. Setting final index...")
+        print("10. Writing to parquet...")
+
+        df_out = df_out.set_index("File Parquet Index",sort=True)
+        df_out = df_out.persist()
+        wait(df_out)
+        print("   Done.")
         dd.to_parquet(
             df_out,
             self.analysispath,
-            engine="fastparquet",
+            engine="pyarrow",
             compression="gzip",
             write_metadata_file=True,
         )
+        print("Complete!")
 
     def export_all_data(self,n_workers=20,memory='8GB'):
 
@@ -274,165 +324,487 @@ class kymograph_viewer:
         kymodat,segdat = self.get_kymograph_data(file_idx,trench_idx)
         self.plot_kymograph_data(kymodat,segdat,x_size=x_size,y_size=y_size)
 
+# def get_image_measurements(
+#     kymographpath, channels, file_idx, output_name, img_fn, *args, **kwargs
+# ):
+
+#     df = dd.read_parquet(kymographpath + "/metadata")
+#     df = df.set_index("File Parquet Index",sort=True)
+
+#     start_idx = int(str(file_idx) + "00000000")
+#     end_idx = int(str(file_idx) + "99999999")
+
+#     working_dfs = []
+
+#     proc_file_path = kymographpath + "/kymograph_" + str(file_idx) + ".hdf5"
+#     with h5py.File(proc_file_path, "r") as infile:
+#         working_filedf = df.loc[start_idx:end_idx].compute(scheduler='threads')
+#         trench_idx_list = working_filedf["File Trench Index"].unique().tolist()
+#         for trench_idx in trench_idx_list:
+#             trench_df = working_filedf[working_filedf["File Trench Index"] == trench_idx]
+#             for channel in channels:
+#                 kymo_arr = infile[channel][trench_idx]
+#                 fn_out = [
+#                 img_fn(kymo_arr[i], *args, **kwargs)
+#                     for i in range(kymo_arr.shape[0])
+#                 ]
+#                 trench_df[channel + " " + output_name] = fn_out
+#             working_dfs.append(trench_df)
+
+
+#     out_df = pd.concat(working_dfs)
+#     return out_df
+
+
+# def get_all_image_measurements(dask_controller, headpath, output_path, channels, output_name, img_fn, *args, **kwargs):
+#     kymographpath = headpath + "/kymograph"
+#     df = dd.read_parquet(kymographpath + "/metadata")
+#     df = df.set_index("File Parquet Index",sort=True)
+#     # n_partitions,divisions = (df.npartitions,df.divisions)
+
+#     file_list = df["File Index"].unique().compute().tolist()
+
+#     df_futures = []
+#     for file_idx in file_list:
+#         df_future = dask_controller.daskclient.submit(get_image_measurements,kymographpath,channels,file_idx,output_name,img_fn,*args,retries=0,**kwargs)
+
+# #         df_delayed = delayed(get_image_measurements)(
+# #             kymographpath, channels, file_idx, output_name, img_fn, *args, **kwargs
+# #         )
+# #         delayed_list.append(df_delayed.persist())
+#         df_futures.append(df_future)
+
+#     while any(future.status == 'pending' for future in df_futures):
+#         sleep(0.1)
+
+#     good_futures = []
+#     for future in df_futures:
+#         if future.status == 'finished':
+#             good_futures.append(future)
+
+#     good_delayed = [delayed(good_future.result)() for good_future in good_futures]
+
+# #     ## filtering out non-failed dataframes ##
+# #     all_delayed_futures = []
+# #     for item in delayed_list:
+# #         all_delayed_futures += futures_of(item)
+# #     while any(future.status == "pending" for future in all_delayed_futures):
+# #         sleep(0.1)
+
+# #     good_delayed = []
+# #     for item in delayed_list:
+# #         if all([future.status == "finished" for future in futures_of(item)]):
+# #             good_delayed.append(item)
+
+#     ## compiling output dataframe ##
+#     df_out = dd.from_delayed(good_delayed).persist()
+#     df_out["FOV Parquet Index"] = df_out.index
+#     df_out = df_out.set_index("FOV Parquet Index", drop=True, sort=False)
+#     df_out = df_out.repartition(partition_size="25MB").persist()
+
+#     dd.to_parquet(
+#         df_out,
+#         output_path,
+#         engine="fastparquet",
+#         compression="gzip",
+#         write_metadata_file=True,
+#     )
+
+
+###Claude
 def get_image_measurements(
-    kymographpath, n_partitions, divisions, channels, file_idx, output_name, img_fn, *args, **kwargs
+    kymographpath, channels, file_idx, output_name, img_fn, *args, **kwargs
 ):
-
-    df = dd.read_parquet(kymographpath + "/metadata",calculate_divisions=True)
-    df = df.set_index("File Parquet Index",sorted=True,npartitions=n_partitions,divisions=divisions)
-
-    start_idx = int(str(file_idx) + "00000000")
-    end_idx = int(str(file_idx) + "99999999")
+    # Read parquet directly in worker - efficient partition access
+    df = dd.read_parquet(kymographpath + "/metadata")
+    
+    # Filter by File Index directly (no need for complex indexing)
+    working_filedf = df[df["File Index"] == file_idx].compute(scheduler='threads')
+    
+    if len(working_filedf) == 0:
+        return pd.DataFrame()
 
     working_dfs = []
-
     proc_file_path = kymographpath + "/kymograph_" + str(file_idx) + ".hdf5"
+    
     with h5py.File(proc_file_path, "r") as infile:
-        working_filedf = df.loc[start_idx:end_idx].compute(scheduler='threads')
         trench_idx_list = working_filedf["File Trench Index"].unique().tolist()
         for trench_idx in trench_idx_list:
-            trench_df = working_filedf[working_filedf["File Trench Index"] == trench_idx]
+            trench_df = working_filedf[working_filedf["File Trench Index"] == trench_idx].copy()
             for channel in channels:
                 kymo_arr = infile[channel][trench_idx]
                 fn_out = [
-                img_fn(kymo_arr[i], *args, **kwargs)
+                    img_fn(kymo_arr[i], *args, **kwargs)
                     for i in range(kymo_arr.shape[0])
                 ]
                 trench_df[channel + " " + output_name] = fn_out
             working_dfs.append(trench_df)
 
-
-    out_df = pd.concat(working_dfs)
-    return out_df
-
+    if working_dfs:
+        out_df = pd.concat(working_dfs)
+        return out_df
+    else:
+        return pd.DataFrame()
 
 def get_all_image_measurements(dask_controller, headpath, output_path, channels, output_name, img_fn, *args, **kwargs):
     kymographpath = headpath + "/kymograph"
-    df = dd.read_parquet(kymographpath + "/metadata",calculate_divisions=True)
-    df = df.set_index("File Parquet Index",sorted=True)
-    n_partitions,divisions = (df.npartitions,df.divisions)
-
-    file_list = df["File Index"].unique().compute().tolist()
+    
+    # Get file list
+    df = dd.read_parquet(kymographpath + "/metadata")
+    file_list = sorted(df["File Index"].unique().compute().tolist())
+    print(f"Processing {len(file_list)} files...")
 
     df_futures = []
     for file_idx in file_list:
-        df_future = dask_controller.daskclient.submit(get_image_measurements,kymographpath,n_partitions,divisions,channels,file_idx,output_name,img_fn,*args,retries=0,**kwargs)
-
-#         df_delayed = delayed(get_image_measurements)(
-#             kymographpath, channels, file_idx, output_name, img_fn, *args, **kwargs
-#         )
-#         delayed_list.append(df_delayed.persist())
+        df_future = dask_controller.daskclient.submit(
+            get_image_measurements,
+            kymographpath,
+            channels,
+            file_idx,
+            output_name,
+            img_fn,
+            *args,
+            retries=1,
+            **kwargs
+        )
         df_futures.append(df_future)
 
+    # Wait with progress
+    from collections import Counter
+    total = len(df_futures)
     while any(future.status == 'pending' for future in df_futures):
-        sleep(0.1)
+        statuses = Counter(f.status for f in df_futures)
+        print(f"Progress: {statuses.get('finished', 0)}/{total} finished, {statuses.get('error', 0)} errors", end="\r")
+        sleep(1)
+    print()
 
     good_futures = []
+    failed_futures = []
     for future in df_futures:
         if future.status == 'finished':
             good_futures.append(future)
+        elif future.status == 'error':
+            failed_futures.append(future)
+    
+    print(f"Completed: {len(good_futures)} succeeded, {len(failed_futures)} failed")
+    
+    if failed_futures:
+        print("First error:")
+        try:
+            failed_futures[0].result()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
-    good_delayed = [delayed(good_future.result)() for good_future in good_futures]
+    if not good_futures:
+        raise ValueError("All futures failed!")
 
-#     ## filtering out non-failed dataframes ##
-#     all_delayed_futures = []
-#     for item in delayed_list:
-#         all_delayed_futures += futures_of(item)
-#     while any(future.status == "pending" for future in all_delayed_futures):
-#         sleep(0.1)
-
-#     good_delayed = []
-#     for item in delayed_list:
-#         if all([future.status == "finished" for future in futures_of(item)]):
-#             good_delayed.append(item)
-
-    ## compiling output dataframe ##
-    df_out = dd.from_delayed(good_delayed).persist()
-    df_out["FOV Parquet Index"] = df_out.index
-    df_out = df_out.set_index("FOV Parquet Index", drop=True, sorted=False)
+    # Gather results directly to client
+    print("Gathering results...")
+    results = dask_controller.daskclient.gather(good_futures)
+    
+    # Filter out empty dataframes
+    results = [r for r in results if len(r) > 0]
+    print(f"Got {len(results)} non-empty results")
+    
+    # Concatenate in pandas
+    print("Concatenating...")
+    df_out = pd.concat(results, ignore_index=True)
+    print(f"Total rows: {len(df_out)}")
+    
+    # Convert to dask and repartition
+    df_out = dd.from_pandas(df_out, npartitions=max(1, len(df_out) // 100000))
     df_out = df_out.repartition(partition_size="25MB").persist()
+    wait(df_out)
 
+    print("Writing to parquet...")
     dd.to_parquet(
         df_out,
         output_path,
-        engine="fastparquet",
+        engine="pyarrow",
         compression="gzip",
         write_metadata_file=True,
     )
+    print("Done!")
+# def get_image_measurements(
+#     kymographpath, metadata_pdf, channels, file_idx, output_name, img_fn, *args, **kwargs
+# ):
+#     """metadata_pdf is a pandas DataFrame, not Dask"""
+    
+#     # Filter to just this file's data (already pandas, no Dask operations)
+#     working_filedf = metadata_pdf[metadata_pdf["File Index"] == file_idx].copy()
+    
+#     if len(working_filedf) == 0:
+#         return pd.DataFrame()  # Return empty if no data for this file
+    
+#     working_dfs = []
+#     proc_file_path = kymographpath + "/kymograph_" + str(file_idx) + ".hdf5"
+    
+#     with h5py.File(proc_file_path, "r") as infile:
+#         trench_idx_list = working_filedf["File Trench Index"].unique().tolist()
+#         for trench_idx in trench_idx_list:
+#             trench_df = working_filedf[working_filedf["File Trench Index"] == trench_idx].copy()
+#             for channel in channels:
+#                 kymo_arr = infile[channel][trench_idx]
+#                 fn_out = [
+#                     img_fn(kymo_arr[i], *args, **kwargs)
+#                     for i in range(kymo_arr.shape[0])
+#                 ]
+#                 trench_df[channel + " " + output_name] = fn_out
+#             working_dfs.append(trench_df)
 
+#     if working_dfs:
+#         out_df = pd.concat(working_dfs)
+#         return out_df
+#     else:
+#         return pd.DataFrame()
+
+
+# def get_all_image_measurements(dask_controller, headpath, output_path, channels, output_name, img_fn, *args, **kwargs):
+#     kymographpath = headpath + "/kymograph"
+    
+#     # Load metadata ONCE as pandas, then scatter to workers
+#     print("Loading metadata...")
+#     metadata_pdf = dd.read_parquet(kymographpath + "/metadata").compute()
+#     print(f"Metadata loaded: {len(metadata_pdf)} rows")
+    
+#     # Scatter the dataframe to workers (efficient for repeated use)
+#     metadata_future = dask_controller.daskclient.scatter(metadata_pdf, broadcast=True)
+    
+#     file_list = metadata_pdf["File Index"].unique().tolist()
+#     print(f"Processing {len(file_list)} files...")
+
+#     df_futures = []
+#     for file_idx in file_list:
+#         df_future = dask_controller.daskclient.submit(
+#             get_image_measurements,
+#             kymographpath,
+#             metadata_future,  # Pass the scattered future
+#             channels,
+#             file_idx,
+#             output_name,
+#             img_fn,
+#             *args,
+#             retries=1,
+#             **kwargs
+#         )
+#         df_futures.append(df_future)
+
+#     # Wait with progress
+#     from collections import Counter
+#     total = len(df_futures)
+#     while any(future.status == 'pending' for future in df_futures):
+#         statuses = Counter(f.status for f in df_futures)
+#         print(f"Progress: {statuses.get('finished', 0)}/{total} finished, {statuses.get('error', 0)} errors", end="\r")
+#         sleep(1)
+#     print()
+
+#     good_futures = []
+#     failed_futures = []
+#     for future in df_futures:
+#         if future.status == 'finished':
+#             good_futures.append(future)
+#         elif future.status == 'error':
+#             failed_futures.append(future)
+    
+#     print(f"Completed: {len(good_futures)} succeeded, {len(failed_futures)} failed")
+    
+#     if failed_futures:
+#         print("First error:")
+#         try:
+#             failed_futures[0].result()
+#         except Exception as e:
+#             import traceback
+#             traceback.print_exc()
+
+#     if not good_futures:
+#         raise ValueError("All futures failed!")
+
+#     # Gather results directly (they're already computed)
+#     print("Gathering results...")
+#     results = dask_controller.daskclient.gather(good_futures)
+    
+#     # Concatenate in pandas, then convert to Dask for writing
+#     print("Concatenating...")
+#     df_out = pd.concat(results, ignore_index=True)
+#     print(f"Total rows: {len(df_out)}")
+    
+#     # Convert to Dask for partitioned write
+#     df_out = dd.from_pandas(df_out, chunksize=100000)
+    
+#     print("Writing to parquet...")
+#     dd.to_parquet(
+#         df_out,
+#         output_path,
+#         engine="pyarrow",
+#         compression="gzip",
+#         write_metadata_file=True,
+#     )
+#     print("Done!")
+# def get_mapping(df):
+#     df = df.apply(lambda x: eval(x)) ## dirty fix to type issue
+#     df1_xy = np.array(df["Frame 1 Position"]).T
+#     df2_xy = np.array(df["Frame 2 Position"]).T
+#     ymat = np.subtract.outer(df1_xy[:,0],df2_xy[:,0])
+#     xmat = np.subtract.outer(df1_xy[:,1],df2_xy[:,1])
+#     distmat = (ymat**2+xmat**2)**(1/2)
+
+#     #ensuring map is one-to-one
+#     mapping = np.argmin(distmat,axis=1)
+#     invmapping = np.argmin(distmat,axis=0)
+
+#     mapping = {idx:map_idx for idx,map_idx in enumerate(mapping) if invmapping[map_idx]==idx}
+
+#     df1_trenchids = df["Frame 1 Trenchid"]
+#     df2_trenchids = df["Frame 2 Trenchid"]
+
+#     trenchid_map = {trenchid: df2_trenchids[mapping[i]] for i,trenchid in enumerate(df1_trenchids)\
+#                         if i in mapping.keys()}
+
+#     return trenchid_map
+
+# def get_trenchid_map(kymodf1,kymodf2,offset_x=0.,offset_y=0.):
+
+#     ## Generates trenchid map from two kymograph dataframes
+#     ## Generally inputs should be kymograph dataframes containing
+#     ## the two timepoints to be used to establish the mapping
+
+#     fovset1 = set(kymodf1["fov"].unique().compute().tolist())
+#     fovset2 = set(kymodf2["fov"].unique().compute().tolist())
+#     fov_intersection = fovset1.intersection(fovset2)
+
+#     fovdf1_groupby = kymodf1.set_index("fov",sorted=True).groupby("fov")
+#     fovdf1_pos = fovdf1_groupby.apply(lambda x:[list(x["y (local)"]),list(x["x (local)"])],meta=list).loc[list(fov_intersection)].to_frame()
+#     fovdf1_pos.columns=["Frame 1 Position"]
+#     fovdf1_trenchid = fovdf1_groupby.apply(lambda x:list(x["trenchid"]),meta=list).loc[list(fov_intersection)].to_frame()
+#     fovdf1_trenchid.columns=["Frame 1 Trenchid"]
+
+#     fovdf2_groupby = kymodf2.set_index("fov",sorted=True).groupby("fov")
+#     if (offset_x == 0.) and (offset_y == 0.):
+#         fovdf2_pos = fovdf2_groupby.apply(lambda x:[list(x["y (local)"]),list(x["x (local)"])],meta=list).loc[list(fov_intersection)].to_frame()
+#     else:
+#         fovdf2_pos = fovdf2_groupby.apply(lambda x:[list(x["y (local)"]-offset_y),list(x["x (local)"]-offset_x)],meta=list).loc[list(fov_intersection)].to_frame()
+#     fovdf2_pos.columns=["Frame 2 Position"]
+#     fovdf2_trenchid = fovdf2_groupby.apply(lambda x:list(x["trenchid"]),meta=list).loc[list(fov_intersection)].to_frame()
+#     fovdf2_trenchid.columns=["Frame 2 Trenchid"]
+
+#     combined_df = fovdf1_pos.join([fovdf1_trenchid,fovdf2_pos,fovdf2_trenchid])
+#     mapping_df = combined_df.apply(get_mapping,axis=1,meta=dict).compute()
+#     mapping_df = mapping_df.apply(lambda x: eval(x))
+
+#     trenchid_map = {key:val for item in mapping_df.to_list() for key,val in item.items()}
+
+#     return trenchid_map
+
+# def files_to_trenchid_map(phenotype_kymopath,barcode_kymopath,offset_x=0.,offset_y=0.):
+
+#     ### Utility for establishing a trenchid map from phenotype data to barcode data
+#     ### Using the last and first timepoints, respectively
+#     ### offsets defined as shift to move phenotype trench to barcode trench position (reason for the sign flip)
+
+#     pheno_kymo_df = dd.read_parquet(phenotype_kymopath,calculate_divisions=True)
+#     barcode_kymo_df = dd.read_parquet(barcode_kymopath,calculate_divisions=True)
+
+#     max_pheno_tpt = pheno_kymo_df.get_partition(0)["timepoints"].max().compute()
+#     min_barcode_tpt = barcode_kymo_df.get_partition(0)["timepoints"].min().compute()
+
+#     last_pheno_tpt_df = pheno_kymo_df[pheno_kymo_df["timepoints"] == max_pheno_tpt]
+#     first_barcode_tpt_df = barcode_kymo_df[barcode_kymo_df["timepoints"] == min_barcode_tpt]
+
+#     trenchid_map = get_trenchid_map(first_barcode_tpt_df,last_pheno_tpt_df,offset_x=-offset_x,offset_y=-offset_y)
+
+#     return trenchid_map
+
+
+###Claude
 def get_mapping(df):
-    df = df.apply(lambda x: eval(x)) ## dirty fix to type issue
+    # Handle both list and string representations
+    def maybe_eval(x):
+        if isinstance(x, str):
+            return eval(x)
+        return x
+    
+    df = df.apply(maybe_eval)
     df1_xy = np.array(df["Frame 1 Position"]).T
     df2_xy = np.array(df["Frame 2 Position"]).T
-    ymat = np.subtract.outer(df1_xy[:,0],df2_xy[:,0])
-    xmat = np.subtract.outer(df1_xy[:,1],df2_xy[:,1])
-    distmat = (ymat**2+xmat**2)**(1/2)
+    ymat = np.subtract.outer(df1_xy[:,0], df2_xy[:,0])
+    xmat = np.subtract.outer(df1_xy[:,1], df2_xy[:,1])
+    distmat = (ymat**2 + xmat**2)**(1/2)
 
-    #ensuring map is one-to-one
-    mapping = np.argmin(distmat,axis=1)
-    invmapping = np.argmin(distmat,axis=0)
+    # ensuring map is one-to-one
+    mapping = np.argmin(distmat, axis=1)
+    invmapping = np.argmin(distmat, axis=0)
 
-    mapping = {idx:map_idx for idx,map_idx in enumerate(mapping) if invmapping[map_idx]==idx}
+    mapping = {idx: map_idx for idx, map_idx in enumerate(mapping) if invmapping[map_idx] == idx}
 
     df1_trenchids = df["Frame 1 Trenchid"]
     df2_trenchids = df["Frame 2 Trenchid"]
 
-    trenchid_map = {trenchid: df2_trenchids[mapping[i]] for i,trenchid in enumerate(df1_trenchids)\
-                        if i in mapping.keys()}
+    trenchid_map = {trenchid: df2_trenchids[mapping[i]] for i, trenchid in enumerate(df1_trenchids)
+                    if i in mapping.keys()}
 
     return trenchid_map
 
-def get_trenchid_map(kymodf1,kymodf2,offset_x=0.,offset_y=0.):
 
+def get_trenchid_map(kymodf1, kymodf2, offset_x=0., offset_y=0.):
     ## Generates trenchid map from two kymograph dataframes
     ## Generally inputs should be kymograph dataframes containing
     ## the two timepoints to be used to establish the mapping
 
-    fovset1 = set(kymodf1["fov"].unique().compute().tolist())
-    fovset2 = set(kymodf2["fov"].unique().compute().tolist())
-    fov_intersection = fovset1.intersection(fovset2)
+    # Compute to pandas early - these are single-timepoint dataframes, so small
+    df1 = kymodf1.compute()
+    df2 = kymodf2.compute()
 
-    fovdf1_groupby = kymodf1.set_index("fov",sorted=True).groupby("fov")
-    fovdf1_pos = fovdf1_groupby.apply(lambda x:[list(x["y (local)"]),list(x["x (local)"])],meta=list).loc[list(fov_intersection)].to_frame()
-    fovdf1_pos.columns=["Frame 1 Position"]
-    fovdf1_trenchid = fovdf1_groupby.apply(lambda x:list(x["trenchid"]),meta=list).loc[list(fov_intersection)].to_frame()
-    fovdf1_trenchid.columns=["Frame 1 Trenchid"]
+    fovset1 = set(df1["fov"].unique().tolist())
+    fovset2 = set(df2["fov"].unique().tolist())
+    fov_intersection = list(fovset1.intersection(fovset2))
 
-    fovdf2_groupby = kymodf2.set_index("fov",sorted=True).groupby("fov")
+    # Filter to intersection FOVs
+    df1 = df1[df1["fov"].isin(fov_intersection)]
+    df2 = df2[df2["fov"].isin(fov_intersection)]
+
+    # Group and aggregate in pandas
+    fovdf1_groupby = df1.groupby("fov")
+    fovdf1_pos = fovdf1_groupby.apply(lambda x: [list(x["y (local)"]), list(x["x (local)"])]).to_frame()
+    fovdf1_pos.columns = ["Frame 1 Position"]
+    fovdf1_trenchid = fovdf1_groupby.apply(lambda x: list(x["trenchid"])).to_frame()
+    fovdf1_trenchid.columns = ["Frame 1 Trenchid"]
+
+    fovdf2_groupby = df2.groupby("fov")
     if (offset_x == 0.) and (offset_y == 0.):
-        fovdf2_pos = fovdf2_groupby.apply(lambda x:[list(x["y (local)"]),list(x["x (local)"])],meta=list).loc[list(fov_intersection)].to_frame()
+        fovdf2_pos = fovdf2_groupby.apply(lambda x: [list(x["y (local)"]), list(x["x (local)"])]).to_frame()
     else:
-        fovdf2_pos = fovdf2_groupby.apply(lambda x:[list(x["y (local)"]-offset_y),list(x["x (local)"]-offset_x)],meta=list).loc[list(fov_intersection)].to_frame()
-    fovdf2_pos.columns=["Frame 2 Position"]
-    fovdf2_trenchid = fovdf2_groupby.apply(lambda x:list(x["trenchid"]),meta=list).loc[list(fov_intersection)].to_frame()
-    fovdf2_trenchid.columns=["Frame 2 Trenchid"]
+        fovdf2_pos = fovdf2_groupby.apply(lambda x: [list(x["y (local)"] - offset_y), list(x["x (local)"] - offset_x)]).to_frame()
+    fovdf2_pos.columns = ["Frame 2 Position"]
+    fovdf2_trenchid = fovdf2_groupby.apply(lambda x: list(x["trenchid"])).to_frame()
+    fovdf2_trenchid.columns = ["Frame 2 Trenchid"]
 
-    combined_df = fovdf1_pos.join([fovdf1_trenchid,fovdf2_pos,fovdf2_trenchid])
-    mapping_df = combined_df.apply(get_mapping,axis=1,meta=dict).compute()
-    mapping_df = mapping_df.apply(lambda x: eval(x))
+    combined_df = fovdf1_pos.join([fovdf1_trenchid, fovdf2_pos, fovdf2_trenchid])
+    mapping_df = combined_df.apply(get_mapping, axis=1)
 
-    trenchid_map = {key:val for item in mapping_df.to_list() for key,val in item.items()}
+    trenchid_map = {key: val for item in mapping_df.to_list() for key, val in item.items()}
 
     return trenchid_map
 
-def files_to_trenchid_map(phenotype_kymopath,barcode_kymopath,offset_x=0.,offset_y=0.):
 
+def files_to_trenchid_map(phenotype_kymopath, barcode_kymopath, offset_x=0., offset_y=0.):
     ### Utility for establishing a trenchid map from phenotype data to barcode data
     ### Using the last and first timepoints, respectively
     ### offsets defined as shift to move phenotype trench to barcode trench position (reason for the sign flip)
 
-    pheno_kymo_df = dd.read_parquet(phenotype_kymopath,calculate_divisions=True)
-    barcode_kymo_df = dd.read_parquet(barcode_kymopath,calculate_divisions=True)
+    pheno_kymo_df = dd.read_parquet(phenotype_kymopath)  # removed calculate_divisions
+    barcode_kymo_df = dd.read_parquet(barcode_kymopath)  # removed calculate_divisions
 
-    max_pheno_tpt = pheno_kymo_df.get_partition(0)["timepoints"].max().compute()
-    min_barcode_tpt = barcode_kymo_df.get_partition(0)["timepoints"].min().compute()
+    max_pheno_tpt = pheno_kymo_df["timepoints"].max().compute()
+    min_barcode_tpt = barcode_kymo_df["timepoints"].min().compute()
 
     last_pheno_tpt_df = pheno_kymo_df[pheno_kymo_df["timepoints"] == max_pheno_tpt]
     first_barcode_tpt_df = barcode_kymo_df[barcode_kymo_df["timepoints"] == min_barcode_tpt]
 
-    trenchid_map = get_trenchid_map(first_barcode_tpt_df,last_pheno_tpt_df,offset_x=-offset_x,offset_y=-offset_y)
+    trenchid_map = get_trenchid_map(first_barcode_tpt_df, last_pheno_tpt_df, offset_x=-offset_x, offset_y=-offset_y)
 
     return trenchid_map
+
 
 def get_called_df(barcode_df, scalar_dict, trenchid_map):
 
